@@ -464,7 +464,10 @@ function validateDraft() {
   const dr = UI.draft;
   if (dr.q === "") { dr.err = "Enter the quantity"; return false; }
   const loc = dr.other ? dr.otherText.trim() : dr.loc;
-  if (+dr.q > 0 && !loc) { dr.err = "Choose a location"; return false; }
+  // a part that has a location in this employee's place keeps one, even when he finds 0 (so new stock has a known shelf)
+  const p = S.parts.get(dr.key.slice(0, -2)), place = dr.key.slice(-1);
+  const hasMine = locsOf(p).some(x => x.t === place);
+  if (!loc && (+dr.q > 0 || hasMine)) { dr.err = "Choose a location"; return false; }
   dr.err = ""; return true;
 }
 function draftLoc() { const dr = UI.draft, place = dr.key.slice(-1); return { loc: dr.other ? dr.otherText.trim() : (dr.loc || ""), lt: dr.other ? place : (dr.lt || place) }; }
