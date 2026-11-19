@@ -1,5 +1,5 @@
 // Offline support: the app opens and works with no internet once it has been opened online one time.
-const VERSION = "lexus-count-v3";
+const VERSION = "lexus-count-v4";
 const SHELL = ["./", "./index.html", "./config.js", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png", "./logo-white.png"];
 const FBV = "10.12.2";
 const CDN = ["app", "auth", "firestore"].map(n => `https://www.gstatic.com/firebasejs/${FBV}/firebase-${n}.js`);

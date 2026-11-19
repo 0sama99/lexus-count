@@ -27,6 +27,7 @@
   --shop-bg:#132d4d;--shop-fg:#bcd7fb;--shop-line:#6aa3ef;
   --wh-bg:#3f2608;--wh-fg:#fbd29d;--wh-line:#e69a45;color-scheme:dark}}
 *{box-sizing:border-box}
+[hidden]{display:none!important}
 html,body{margin:0}
 body{background:var(--bg);color:var(--fg);font-family:var(--font-ui);font-size:16px;line-height:1.45;
   padding:max(12px,env(safe-area-inset-top)) max(16px,env(safe-area-inset-right)) max(32px,env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left))}
@@ -86,7 +87,7 @@ button:focus-visible,input:focus-visible{outline:3px solid var(--shop-line);outl
 .rv .line{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:15px}
 .acts{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .sm{min-height:40px;border-radius:10px;padding:0 14px;font-size:15px;font-weight:600;border:1.5px solid var(--line);background:var(--surface)}
-.sm.go{border-color:var(--go)}
+.sm.go{background:var(--go);color:var(--go-fg);border-color:var(--go)}
 .sm.red{color:var(--danger);border-color:var(--danger)}
 .diff{color:var(--danger);font-weight:600}
 .same{color:var(--ok);font-weight:600}
@@ -231,9 +232,9 @@ function demoStore() {
     signOut() { S.email = null; S.role = null; S.phase = "login"; render(); },
     touch() {},
     saveEntry(e) { S.entries.set(e.part + "_" + e.place, Object.assign({}, e, { by: S.email, role: S.role, countedAt: Date.now(), sentAt: Date.now(), status: "counted" })); S.presence.set(S.email, { lastSeen: Date.now(), role: S.role }); render(); },
-    async approve(ids) { ids.forEach(id => S.parts.get(id).approved = { at: Date.now(), by: S.email }); log("approve", ids.length + " قطعة"); render(); },
-    async unapprove(id) { S.parts.get(id).approved = null; log("unapprove", id); render(); },
-    async recount(id, places) { for (const pl of places) { const e = S.entries.get(id + "_" + pl); if (e) e.status = "recount"; } log("recount", id + " " + places.join("+")); render(); },
+    async approve(ids, auto) { ids.forEach(id => S.parts.get(id).approved = { at: Date.now(), by: S.email, auto: !!auto }); if (!auto) log("approve", ids.length + " قطعة"); render(); },
+    async unapprove(id) { Object.assign(S.parts.get(id), { approved: null, hold: true }); log("unapprove", id); render(); },
+    async recount(id, places) { for (const pl of places) { const e = S.entries.get(id + "_" + pl); if (e) e.status = "recount"; } Object.assign(S.parts.get(id), { approved: null, hold: false }); log("recount", id + " " + places.join("+")); render(); },
     async markExported(ids, kind) { ids.forEach(id => S.parts.get(id)[kind === "S" ? "expS" : "expW"] = true); log("export", kind + " " + ids.length); render(); },
     async importData(d) { const keep = new Map(S.parts); put(buildParts(d).map(p => Object.assign({}, keep.get(p.id) ? { approved: keep.get(p.id).approved, expS: keep.get(p.id).expS, expW: keep.get(p.id).expW } : {}, p))); for (const id of keep.keys()) if (!S.parts.has(id)) S.parts.set(id, Object.assign(keep.get(id), { gone: true })); log("import", d.parts.length + " قطعة"); render(); },
     async setDays(n) { S.settings.days = n; render(); }
@@ -272,7 +273,7 @@ async function firebaseStore() {
     roleUnsubs.push(F.onSnapshot(F.collection(db, "parts"), snap => {
       for (const ch of snap.docChanges()) {
         if (ch.type === "removed") S.parts.delete(ch.doc.id);
-        else { const d = dataOf(ch.doc); S.parts.set(ch.doc.id, Object.assign({ id: ch.doc.id, s: [], w: [], approved: null, expS: false, expW: false, gone: false }, d, { approved: d.approved ? { at: tsMs(d.approved.at), by: d.approved.by } : null })); }
+        else { const d = dataOf(ch.doc); S.parts.set(ch.doc.id, Object.assign({ id: ch.doc.id, s: [], w: [], approved: null, expS: false, expW: false, gone: false }, d, { approved: d.approved ? { at: tsMs(d.approved.at), by: d.approved.by, auto: !!d.approved.auto } : null })); }
       }
       S.partsLoaded = true; render();
     }, err => { console.error(err); toast("Could not load parts"); }));
@@ -316,9 +317,13 @@ async function firebaseStore() {
       }).catch(err => { console.error(err); toast("Not saved. Tell the manager."); });
       this.touch();
     },
-    async approve(ids) { await batches(ids.map(id => b => b.update(F.doc(db, "parts", id), { approved: { at: F.serverTimestamp(), by: S.email } }))); log("approve", ids.length + " قطعة"); },
-    async unapprove(id) { await F.updateDoc(F.doc(db, "parts", id), { approved: null }); log("unapprove", id); },
-    async recount(id, places) { await batches(places.map(pl => b => b.set(F.doc(db, "entries", id + "_" + pl), { status: "recount", recountAt: F.serverTimestamp() }, { merge: true }))); log("recount", id + " " + places.join("+")); },
+    async approve(ids, auto) { await batches(ids.map(id => b => b.update(F.doc(db, "parts", id), { approved: { at: F.serverTimestamp(), by: S.email, auto: !!auto } }))); if (!auto) log("approve", ids.length + " قطعة"); },
+    async unapprove(id) { await F.updateDoc(F.doc(db, "parts", id), { approved: null, hold: true }); log("unapprove", id); },
+    async recount(id, places) {
+      const ops = places.map(pl => b => b.set(F.doc(db, "entries", id + "_" + pl), { status: "recount", recountAt: F.serverTimestamp() }, { merge: true }));
+      ops.push(b => b.update(F.doc(db, "parts", id), { approved: null, hold: false }));
+      await batches(ops); log("recount", id + " " + places.join("+"));
+    },
     async markExported(ids, kind) { await batches(ids.map(id => b => b.update(F.doc(db, "parts", id), kind === "S" ? { expS: true } : { expW: true }))); log("export", (kind === "S" ? "المحل " : "المستودع ") + ids.length); },
     async importData(d) {
       const list = buildParts(d), ids = new Set(list.map(p => p.id));
@@ -513,6 +518,34 @@ function renderAllDone(tasks) {
 }
 
 /* ================= manager ================= */
+/* time between one employee's consecutive counts, and auto-approval of matching parts */
+const FAST_SEC = 15;
+let GAPS = new Map();
+function computeGaps() {
+  GAPS = new Map(); const byRole = {};
+  for (const [id, e] of S.entries) if (counted(e) && e.countedAt) (byRole[e.role] = byRole[e.role] || []).push([id, e.countedAt]);
+  for (const list of Object.values(byRole)) {
+    list.sort((a, b) => a[1] - b[1]);
+    for (let i = 1; i < list.length; i++) {
+      const g = (list[i][1] - list[i - 1][1]) / 1000;
+      if (g < 3600 && sameDayPair(list[i][1], list[i - 1][1])) GAPS.set(list[i][0], g);
+    }
+  }
+}
+const sameDayPair = (a, b) => new Date(a).toDateString() === new Date(b).toDateString();
+function gapTxt(s) { s = Math.round(s); return s < 60 ? `${s} ث` : `${Math.floor(s / 60)} د ${s % 60} ث`; }
+function gapBadge(id) { const g = GAPS.get(id); if (g == null) return ""; return `<span class="${g < FAST_SEC ? "diff" : "sub"}" title="الوقت من العدّة اللي قبلها لنفس الموظف">⏱ ${gapTxt(g)}</span>`; }
+const isFast = p => partKeys(p).some(k => { const g = GAPS.get(k); return g != null && g < FAST_SEC; });
+const autoBusy = new Set(); let autoTimer = null;
+function scheduleAuto() {
+  clearTimeout(autoTimer);
+  autoTimer = setTimeout(() => {
+    const ids = activeParts().filter(p => !p.hold && !autoBusy.has(p.id) && partStatus(p) === "review" && partTotal(p) === p.q).map(p => p.id);
+    if (!ids.length) return;
+    ids.forEach(id => autoBusy.add(id));
+    store.approve(ids, true).catch(e => console.error(e)).finally(() => ids.forEach(id => autoBusy.delete(id)));
+  }, 400);
+}
 function counts() { const c = { remaining: 0, waiting: 0, review: 0, approved: 0 }; activeParts().forEach(p => c[partStatus(p)]++); return c; }
 function empName(role) { for (const [em, r] of S.roles) if (r.role === role) return r.name || em; return ROLES[role] ? ROLES[role].ar : role; }
 function empEmail(role) { for (const [em, r] of S.roles) if (r.role === role) return em; return null; }
@@ -542,11 +575,13 @@ function renderDash() {
     const d = ks.filter(k => counted(S.entries.get(k))).length;
     const today = ks.filter(k => { const e = S.entries.get(k); return counted(e) && sameDay(e.countedAt); }).length;
     const rc = ks.filter(k => S.entries.get(k)?.status === "recount").length;
+    const tg = ks.filter(k => { const e = S.entries.get(k); return counted(e) && sameDay(e.countedAt) && GAPS.has(k); }).map(k => GAPS.get(k));
+    const avg = tg.length ? tg.reduce((a, b) => a + b, 0) / tg.length : null;
     const em = empEmail(r), seen = em && S.presence.get(em)?.lastSeen;
     const pp = ks.length ? Math.round(d / ks.length * 100) : 0;
     return `<div class="card" style="gap:8px"><div class="bar"><b>${esc(empName(r))} <span class="sub">· ${ROLES[r].ar}</span></b><span class="sub">اليوم ${today} / ${Math.ceil(ks.length / Math.max(1, S.settings.days || 6))}</span></div>
       <div class="meter"><i style="width:${pp}%"></i></div>
-      <div class="sub">${N(d)} من ${N(ks.length)} (${pp}%)${rc ? ` · <span class="diff">${rc} إعادة عد</span>` : ""} · آخر اتصال: ${seen ? `<span dir="ltr">${fmtTs(seen)}</span>` : "ما اتصل لين الحين"}</div></div>`;
+      <div class="sub">${N(d)} من ${N(ks.length)} (${pp}%)${rc ? ` · <span class="diff">${rc} إعادة عد</span>` : ""} · آخر اتصال: ${seen ? `<span dir="ltr">${fmtTs(seen)}</span>` : "ما اتصل لين الحين"}${avg != null ? ` · متوسط القطعة اليوم: ${gapTxt(avg)}` : ""}</div></div>`;
   }).join("");
   mgrShell(`
     <div class="card" style="gap:8px"><div class="bar"><b>نسبة الإنجاز</b><span class="progress">${pct}%</span></div>
@@ -568,7 +603,7 @@ function entryLine(p, place) {
   return `<div class="line"><span class="pill ${place}">${name}</span><b>${e.q}</b>
     ${e.loc ? `<span class="pill ${e.lt}"><span class="mono" dir="ltr">${esc(e.loc)}</span></span>` : `<span class="sub">بدون موقع</span>`}
     <span class="sub">${esc(empName(e.role))}</span>
-    <span class="sub" dir="ltr" style="font-variant-numeric:tabular-nums">🕒 ${fmtTs(e.countedAt)}</span></div>`;
+    <span class="sub" dir="ltr" style="font-variant-numeric:tabular-nums">🕒 ${fmtTs(e.countedAt)}</span> ${gapBadge(k)}</div>`;
 }
 function headLine(p) {
   const tot = partTotal(p), d = tot - p.q;
@@ -600,19 +635,36 @@ function renderReview() {
     <div class="bar"><h2>تنتظر مراجعتك (${N(list.length)})</h2>
       ${matching.length && !UI.confirmBulk ? `<button class="sm" data-act="bulkAsk">اعتماد المطابقة (${N(matching.length)})…</button>` : ""}</div>
     ${bulk}
-    <p class="note">اللي فيها فرق تطلع فوق. القطعة اللي انعدت في مكان واحد وتنتظر الثاني ما تطلع هنا لين يكتمل عدها.</p>
+    <p class="note">هنا القطع اللي فيها فرق بس. المطابقة تنعتمد تلقائياً وتلقاها في "المعتمدة". والقطعة اللي انعدت في مكان واحد وتنتظر الثاني ما تطلع لين يكتمل عدها.</p>
     <div>${rows || `<p class="note">ما فيه قطع تنتظر المراجعة الحين.</p>`}</div>
     ${list.length > shown.length ? `<button class="sm" data-act="more">عرض المزيد</button>` : ""}</div>`);
 }
+function rcButtons(p) {
+  const place0 = partKeys(p)[0].slice(-1);
+  return UI.rcOpen === p.id && twoPlaces(p)
+    ? `<span class="sub">إعادة عد:</span>
+        <button class="sm red" data-act="rc" data-id="${esc(p.id)}" data-p="S">المحل</button>
+        <button class="sm red" data-act="rc" data-id="${esc(p.id)}" data-p="W">المستودع</button>
+        <button class="sm red" data-act="rc" data-id="${esc(p.id)}" data-p="SW">الاثنين</button>
+        <button class="sm" data-act="rcClose">إلغاء</button>`
+    : `<button class="sm red" data-act="${twoPlaces(p) ? "rcOpen" : "rc"}" data-id="${esc(p.id)}" data-p="${place0}">إعادة عد</button>`;
+}
 function renderApproved() {
-  const list = activeParts().filter(p => p.approved).sort((a, b) => (b.approved.at || 0) - (a.approved.at || 0));
+  const all = activeParts().filter(p => p.approved).sort((a, b) => (b.approved.at || 0) - (a.approved.at || 0));
+  const fastN = all.filter(isFast).length;
+  const list = UI.fastOnly ? all.filter(isFast) : all;
   const shown = list.slice(0, UI.page * 40);
-  const rows = shown.map(p => `<div class="rv">${headLine(p)}${entryLine(p, "S")}${entryLine(p, "W")}
-      <div class="acts">${p.expS || p.expW ? `<span class="sub">انصدرت، ما تقدر تلغي اعتمادها</span>` : `<button class="sm" data-act="unapprove" data-id="${esc(p.id)}">إلغاء الاعتماد</button>`}</div></div>`).join("");
-  mgrShell(`<div class="card"><h2>المعتمدة (${N(list.length)})</h2>
-    <p class="note">آخر اللي اعتمدته فوق. إلغاء الاعتماد يرجّع القطعة للمراجعة.</p>
-    <div>${rows || `<p class="note">ما اعتمدت أي قطعة لين الحين.</p>`}</div>
+  const rows = shown.map(p => `<div class="rv">${headLine(p)}
+      <div class="line"><span class="sub">${p.approved.auto ? "اعتماد تلقائي (مطابق)" : "اعتمدتها أنت"} · <span dir="ltr">${fmtTs(p.approved.at)}</span></span>${isFast(p) ? ` <span class="diff">⚠ سريعة</span>` : ""}</div>
+      ${entryLine(p, "S")}${entryLine(p, "W")}
+      <div class="acts">${p.expS || p.expW ? `<span class="sub">انصدرت، ما تقدر تغيّرها</span>`
+        : `${rcButtons(p)}${UI.rcOpen === p.id && twoPlaces(p) ? "" : `<button class="sm" data-act="unapprove" data-id="${esc(p.id)}">رجّعها للمراجعة</button>`}`}</div></div>`).join("");
+  mgrShell(`<div class="card"><h2>المعتمدة (${N(all.length)})</h2>
+    <p class="note">آخر المعتمد فوق. ⏱ = الوقت بين العدّة واللي قبلها لنفس الموظف، والأحمر أقل من ${FAST_SEC} ثانية. "إعادة عد" ترجّعها للموظف، و"رجّعها للمراجعة" تخليها تنتظر قرارك.</p>
+    <label class="sub" style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="fastOnly" ${UI.fastOnly ? "checked" : ""}> السريعة بس (${N(fastN)})</label>
+    <div>${rows || `<p class="note">${UI.fastOnly ? "ما فيه قطع سريعة." : "ما فيه قطع معتمدة لين الحين."}</p>`}</div>
     ${list.length > shown.length ? `<button class="sm" data-act="more">عرض المزيد</button>` : ""}</div>`);
+  const cb = document.getElementById("fastOnly"); cb.addEventListener("change", () => { UI.fastOnly = cb.checked; UI.page = 1; render(); });
 }
 const HEAD = { S: ["رقم القطعة", "الكمية المعدودة", "كمية النظام", "منها على X", "منها بدون X", "موقع المحل", "وقت عد المحل", "وقت عد المستودع"], W: ["رقم القطعة", "الموقع"], P: ["الرقم بدون X"] };
 const FNAME = { S: "قائمة المحل", W: "قائمة المستودع", P: "أرقام المبرمج" };
@@ -702,6 +754,7 @@ function render() {
   if (!store || S.phase === "boot") { app.innerHTML = `<div class="wrap"><p class="sub">Loading…</p></div>`; return; }
   if (S.phase === "login") return renderLogin();
   if (S.phase === "norole") return renderNoRole();
+  if (S.role === "admin") { computeGaps(); if (S.partsLoaded) scheduleAuto(); }
   if (S.role === "admin") return ({ dash: renderDash, review: renderReview, approved: renderApproved, export: renderExport, data: renderData })[UI.tab]();
   if (!ROLES[S.role]) return renderNoRole();
   if (UI.view === "summary" && UI.draft) return renderSummary();
