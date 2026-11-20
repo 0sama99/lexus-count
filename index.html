@@ -565,6 +565,35 @@ function mgrShell(body) {
     <p class="sig">إعداد: أسامة</p>
   </div>`;
 }
+/* working hours: an employee's counts split into sessions wherever two counts are more than SESSION_GAP_MIN apart
+   (noon break and after closing are separate sessions). Session time = first to last count + 1 minute for the first part. */
+const SESSION_GAP_MIN = 20;
+const AR_DAYS = ["الأحد", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"];
+function sessionsOf(role) {
+  const ts = [];
+  for (const e of S.entries.values()) if (e.role === role && counted(e) && e.countedAt) ts.push(e.countedAt);
+  ts.sort((a, b) => a - b);
+  const out = [];
+  for (const t of ts) {
+    const s = out[out.length - 1];
+    if (s && t - s.end <= SESSION_GAP_MIN * 60000) { s.end = t; s.n++; } else out.push({ start: t, end: t, n: 1 });
+  }
+  out.forEach(s => s.sec = (s.end - s.start) / 1000 + 60);
+  return out;
+}
+function tmAr(ms) { const d = new Date(ms), h = d.getHours(); return `${h % 12 || 12}:${p2(d.getMinutes())} ${h < 12 ? "ص" : "م"}`; }
+function durTxt(sec) { const m = Math.round(sec / 60), h = Math.floor(m / 60); return h ? `${h} س${m % 60 ? ` ${m % 60} د` : ""}` : `${m} د`; }
+function hoursLine(role) {
+  const ss = sessionsOf(role);
+  if (!ss.length) return "";
+  const todayS = ss.filter(s => sameDay(s.start));
+  const week = ss.reduce((a, s) => a + s.sec, 0);
+  const byDay = new Map();
+  for (const s of ss) { const k = new Date(s.start).toDateString(); byDay.set(k, (byDay.get(k) || 0) + s.sec); }
+  const days = [...byDay.entries()].map(([k, sec]) => `${AR_DAYS[new Date(k).getDay()]} ${durTxt(sec)}`).join(" · ");
+  return `<div class="sub">⏰ اليوم: ${todayS.length ? todayS.map(s => `<bdi>${tmAr(s.start)}</bdi> – <bdi>${tmAr(s.end)}</bdi>`).join(" · ") + ` · <b>${durTxt(todayS.reduce((a, s) => a + s.sec, 0))}</b>` : "ما اشتغل"} · المجموع: <b>${durTxt(week)}</b></div>
+    ${byDay.size > 1 ? `<div class="sub">${days}</div>` : ""}`;
+}
 function renderDash() {
   if (!activeParts().length) return mgrShell(`<div class="card"><h2>ما فيه بيانات لين الحين</h2><p class="note">روح لتبويب "البيانات" وارفع ملف app_data.json.</p><button class="sm go" data-act="tab" data-tab="data">البيانات</button></div>`);
   const c = counts();
@@ -584,7 +613,8 @@ function renderDash() {
     const pp = ks.length ? Math.round(d / ks.length * 100) : 0;
     return `<div class="card" style="gap:8px"><div class="bar"><b>${esc(empName(r))} <span class="sub">· ${ROLES[r].ar}</span></b><span class="sub">اليوم ${today} / ${Math.ceil(ks.length / Math.max(1, S.settings.days || 6))}</span></div>
       <div class="meter"><i style="width:${pp}%"></i></div>
-      <div class="sub">${N(d)} من ${N(ks.length)} (${pp}%)${rc ? ` · <span class="diff">${rc} إعادة عد</span>` : ""} · آخر اتصال: ${seen ? `<span dir="ltr">${fmtTs(seen)}</span>` : "ما اتصل لين الحين"}${avg != null ? ` · متوسط القطعة اليوم: ${gapTxt(avg)}` : ""}</div></div>`;
+      <div class="sub">${N(d)} من ${N(ks.length)} (${pp}%)${rc ? ` · <span class="diff">${rc} إعادة عد</span>` : ""} · آخر اتصال: ${seen ? `<span dir="ltr">${fmtTs(seen)}</span>` : "ما اتصل لين الحين"}${avg != null ? ` · متوسط القطعة اليوم: ${gapTxt(avg)}` : ""}</div>
+      ${hoursLine(r)}</div>`;
   }).join("");
   mgrShell(`
     <div class="card" style="gap:8px"><div class="bar"><b>نسبة الإنجاز</b><span class="progress">${pct}%</span></div>
@@ -596,7 +626,8 @@ function renderDash() {
       <div class="stat"><div class="sub">معتمدة</div><div class="n">${N(c.approved)}</div></div>
     </div>
     <h2>الموظفين</h2>${emp}
-    <p class="note">آخر اتصال = آخر مرة وصل فيها جوال الموظف للنت. العدّات اللي على جواله وما انرسلت ما تبين لك لين يتصل.</p>`);
+    <p class="note">آخر اتصال = آخر مرة وصل فيها جوال الموظف للنت. العدّات اللي على جواله وما انرسلت ما تبين لك لين يتصل.</p>
+    <p class="note">⏰ ساعات الشغل تقريبية من أوقات العدّ: أي فاصل أكثر من ${SESSION_GAP_MIN} دقيقة بين عدّتين يعتبر استراحة. وقت المشي والتجهيز قبل أول عدّة ما ينحسب، والقطعة اللي رجعت لإعادة العد ينحسب وقت عدّها الأخير بس.</p>`);
 }
 function entryLine(p, place) {
   const k = p.id + "_" + place;
