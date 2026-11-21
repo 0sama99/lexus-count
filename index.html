@@ -143,7 +143,8 @@ const S = {
   loginErr: "", loginBusy: false
 };
 const UI = { view: "count", editKey: null, from: "count", draft: null, tab: "dash", page: 1, rcOpen: null,
-  confirmBulk: false, inclOld: false, importPreview: null, importBusy: false, confirmSignOut: false };
+  confirmBulk: false, inclOld: false, importPreview: null, importBusy: false, confirmSignOut: false,
+  who: "", fastOnly: false, rcOnly: false, q: "", qDraft: "" };  // manager filters + part-number search (review / approved / exported); kept when switching tabs
 addEventListener("online", () => { S.online = true; store.touch && store.touch(); render(); });
 addEventListener("offline", () => { S.online = false; render(); });
 
@@ -178,6 +179,15 @@ function reopenUpdate(p, places) {
   if (p.expS) upd.prevS = { q: p.expSQ ?? null, loc: p.expSLoc ?? "", at: p.expSAt || null };
   if (p.expW) upd.prevW = { loc: p.expWLoc ?? "", at: p.expWAt || null };
   return upd;
+}
+// The count a recount replaces (the employee's new count overwrites the entry), kept on the part so the manager still sees it.
+function rcSnaps(id, places) {
+  const out = [];
+  for (const pl of places) {
+    const e = S.entries.get(id + "_" + pl);
+    if (counted(e)) out.push({ place: pl, q: e.q, loc: e.loc || "", lt: e.lt || pl, role: e.role || "", by: e.by || "", at: e.countedAt || null, rcAt: Date.now() });
+  }
+  return out;
 }
 let store;
 
@@ -240,9 +250,9 @@ function demoStore() {
     saveEntry(e) { S.entries.set(e.part + "_" + e.place, Object.assign({}, e, { by: S.email, role: S.role, countedAt: Date.now(), sentAt: Date.now(), status: "counted" })); S.presence.set(S.email, { lastSeen: Date.now(), role: S.role }); render(); },
     async approve(ids, auto) { ids.forEach(id => S.parts.get(id).approved = { at: Date.now(), by: S.email, auto: !!auto }); if (!auto) log("approve", ids.length + " قطعة"); render(); },
     async unapprove(id) { Object.assign(S.parts.get(id), { approved: null, hold: true }); log("unapprove", id); render(); },
-    async recount(id, places) { for (const pl of places) { const e = S.entries.get(id + "_" + pl); if (e) e.status = "recount"; } Object.assign(S.parts.get(id), { approved: null, hold: false }); log("recount", id + " " + places.join("+")); render(); },
+    async recount(id, places) { const p = S.parts.get(id), snaps = rcSnaps(id, places); for (const pl of places) { const e = S.entries.get(id + "_" + pl); if (e) e.status = "recount"; } Object.assign(p, { approved: null, hold: false }, snaps.length ? { rcHist: (p.rcHist || []).concat(snaps) } : {}); log("recount", id + " " + places.join("+")); render(); },
     async markExported(snaps, kind) { snaps.forEach(s => Object.assign(S.parts.get(s.id), kind === "S" ? { expS: true, expSAt: Date.now(), expSQ: s.q, expSLoc: s.loc || "" } : { expW: true, expWAt: Date.now(), expWLoc: s.loc || "" })); log("export", kind + " " + snaps.length); render(); },
-    async reopenExported(id, places) { const p = S.parts.get(id), upd = reopenUpdate(p, places); for (const pl of places) { const e = S.entries.get(id + "_" + pl); if (e) e.status = "recount"; } Object.assign(p, upd); log(places.length ? "recount" : "unapprove", id + " بعد التصدير"); render(); },
+    async reopenExported(id, places) { const p = S.parts.get(id), upd = reopenUpdate(p, places), snaps = rcSnaps(id, places); if (snaps.length) upd.rcHist = (p.rcHist || []).concat(snaps); for (const pl of places) { const e = S.entries.get(id + "_" + pl); if (e) e.status = "recount"; } Object.assign(p, upd); log(places.length ? "recount" : "unapprove", id + " بعد التصدير"); render(); },
     async importData(d) { const keep = new Map(S.parts); put(buildParts(d).map(p => Object.assign({}, keep.get(p.id) ? { approved: keep.get(p.id).approved, expS: keep.get(p.id).expS, expW: keep.get(p.id).expW } : {}, p))); for (const id of keep.keys()) if (!S.parts.has(id)) S.parts.set(id, Object.assign(keep.get(id), { gone: true })); log("import", d.parts.length + " قطعة"); render(); },
     async setDays(n) { S.settings.days = n; render(); }
   };
@@ -330,8 +340,10 @@ async function firebaseStore() {
     async approve(ids, auto) { await batches(ids.map(id => b => b.update(F.doc(db, "parts", id), { approved: { at: F.serverTimestamp(), by: S.email, auto: !!auto } }))); if (!auto) log("approve", ids.length + " قطعة"); },
     async unapprove(id) { await F.updateDoc(F.doc(db, "parts", id), { approved: null, hold: true }); log("unapprove", id); },
     async recount(id, places) {
+      const snaps = rcSnaps(id, places), upd = { approved: null, hold: false };
+      if (snaps.length) upd.rcHist = F.arrayUnion(...snaps);
       const ops = places.map(pl => b => b.set(F.doc(db, "entries", id + "_" + pl), { status: "recount", recountAt: F.serverTimestamp() }, { merge: true }));
-      ops.push(b => b.update(F.doc(db, "parts", id), { approved: null, hold: false }));
+      ops.push(b => b.update(F.doc(db, "parts", id), upd));
       await batches(ops); log("recount", id + " " + places.join("+"));
     },
     async markExported(snaps, kind) {
@@ -344,7 +356,8 @@ async function firebaseStore() {
     async reopenExported(id, places) {
       // places = [] -> back to review only; ["S"] / ["W"] / ["S","W"] -> recount. Both export marks are cleared,
       // so the part goes into the next export of both lists, flagged as a correction.
-      const p = S.parts.get(id), upd = reopenUpdate(p, places);
+      const p = S.parts.get(id), upd = reopenUpdate(p, places), snaps = rcSnaps(id, places);
+      if (snaps.length) upd.rcHist = F.arrayUnion(...snaps);
       const ops = places.map(pl => b => b.set(F.doc(db, "entries", id + "_" + pl), { status: "recount", recountAt: F.serverTimestamp() }, { merge: true }));
       ops.push(b => b.update(F.doc(db, "parts", id), upd));
       await batches(ops);
@@ -580,6 +593,7 @@ function empEmail(role) { for (const [em, r] of S.roles) if (r.role === role) re
 function mgrShell(body) {
   const tabs = [["dash", "المتابعة"], ["review", "المراجعة"], ["approved", "المعتمدة"], ["exported", "المصدّرة"], ["export", "التصدير"], ["data", "البيانات"]];
   const c = counts();
+  const ae = document.activeElement, keepQ = ae && ae.id === "mq" ? [ae.selectionStart, ae.selectionEnd] : null;
   app.innerHTML = `<div class="wrap wide" dir="rtl" lang="ar">
     <div class="brandband"><img src="logo-white.png" alt="الموسى" style="height:46px"><div><h1>جرد قطع لكزس</h1><div class="sub">لوحة المدير ${store.demo ? "· تجربة" : ""}</div></div>
       <button class="chipbtn" data-act="signOutNow">${store.demo ? "تبديل المستخدم" : "خروج"}</button></div>
@@ -589,6 +603,7 @@ function mgrShell(body) {
     ${body}
     <p class="sig">إعداد: أسامة</p>
   </div>`;
+  if (keepQ) { const m = document.getElementById("mq"); if (m) { m.focus(); try { m.setSelectionRange(keepQ[0], keepQ[1]); } catch (e) {} } }
 }
 /* working hours: an employee's counts split into sessions wherever two counts are more than SESSION_GAP_MIN apart
    (noon break and after closing are separate sessions). Session time = first to last count + 1 minute for the first part. */
@@ -673,11 +688,46 @@ function headLine(p) {
   return `<div class="bar"><span><b class="mono" dir="ltr">${esc(p.n)}</b>${corrBadge(p)}</span>
     <span>النظام <b>${p.q}</b> · الإجمالي <b>${tot}</b> · ${d === 0 ? `<span class="same">مطابق</span>` : `<span class="diff">فرق ${d > 0 ? "+" : ""}${d}</span>`}</span></div>`;
 }
+/* recount history: the count each recount replaced (part.rcHist), shown as "before" */
+const wasRecounted = p => !!(p.rcHist && p.rcHist.length);
+function rcLines(p) {
+  if (!wasRecounted(p)) return "";
+  return p.rcHist.map(h => `<div class="line"><span class="diff">⟲ أُعيد عدها</span><span class="sub">قبل:</span>
+    <span class="pill ${h.place}">${h.place === "S" ? "المحل" : "المستودع"}</span><b>${h.q}</b>
+    ${h.loc ? `<span class="pill ${h.lt || h.place}"><span class="mono" dir="ltr">${esc(h.loc)}</span></span>` : `<span class="sub">بدون موقع</span>`}
+    <span class="sub">${esc(empName(h.role))}</span><span class="sub" dir="ltr" style="font-variant-numeric:tabular-nums">🕒 ${fmtTs(h.at)}</span></div>`).join("");
+}
+/* manager filters for review / approved / exported: person (who counted it), fast counts, recounted.
+   A part counted in both places shows under both people. */
+const countedBy = (p, role) => partKeys(p).some(k => { const e = S.entries.get(k); return counted(e) && e.role === role; });
+// part-number search: any piece of the number, with or without X; dashes, spaces and case ignored; Arabic digits accepted
+const normNo = v => String(v || "").replace(/[٠-٩]/g, d => "٠١٢٣٤٥٦٧٨٩".indexOf(d)).replace(/[۰-۹]/g, d => "۰۱۲۳۴۵۶۷۸۹".indexOf(d)).toUpperCase().replace(/[^A-Z0-9]/g, "");
+const matchNo = (p, q) => !q || normNo(p.n).includes(q) || normNo(p.p).includes(q);
+function filterParts(list, withFast) {
+  const q = normNo(UI.q);
+  const found = list.filter(p => matchNo(p, q));
+  const tog = found.filter(p => (!withFast || !UI.fastOnly || isFast(p)) && (!UI.rcOnly || wasRecounted(p)));
+  const byWho = l => UI.who ? l.filter(p => countedBy(p, UI.who)) : l;
+  const who = [["", "الكل", tog.length]].concat(EMP_ROLES.map(r => [r, empName(r), tog.filter(p => countedBy(p, r)).length]));
+  const base = byWho(found), out = byWho(tog);
+  const chip = (on, act, attr, label) => `<button class="tab ${on ? "on" : ""}" data-act="${act}" ${attr} aria-pressed="${on}">${label}</button>`;
+  const bar = `<div style="display:flex;flex-direction:column;gap:8px">
+    <form id="mqForm" role="search" style="display:flex;gap:8px;align-items:center">
+      <input id="mq" type="search" dir="ltr" autocomplete="off" autocapitalize="characters" spellcheck="false" enterkeyhint="search" aria-label="ابحث برقم القطعة" placeholder="ابحث برقم القطعة"
+        value="${esc(UI.qDraft)}" style="flex:1;min-width:0;height:44px;border:1.5px solid var(--line);border-radius:10px;padding:0 12px;background:var(--surface);color:var(--fg);font-size:16px;font-family:var(--font-mono)">
+      <button class="sm go" type="submit">بحث</button>${UI.q ? `<button class="sm" type="button" data-act="qClear">مسح</button>` : ""}</form>
+    ${UI.q ? `<p class="sub" style="margin:0">البحث عن <bdi class="mono" dir="ltr">${esc(UI.q)}</bdi>: ${N(found.length)} قطعة في هذا التبويب</p>` : ""}
+    <div class="tabs" style="flex-wrap:wrap" role="group" aria-label="الشخص">${who.map(([r, l, n]) => chip(UI.who === r, "who", `data-r="${r}"`, `${esc(l)} (${N(n)})`)).join("")}</div>
+    <div class="tabs" style="flex-wrap:wrap" role="group" aria-label="فلتر">${withFast ? chip(UI.fastOnly, "flt", `data-k="fastOnly"`, `⚠ السريعة بس (${N(base.filter(isFast).length)})`) : ""}${chip(UI.rcOnly, "flt", `data-k="rcOnly"`, `⟲ أُعيد عدها بس (${N(base.filter(wasRecounted).length)})`)}</div></div>`;
+  const filtered = !!(q || UI.who || UI.rcOnly || (withFast && UI.fastOnly));
+  return { list: out, bar, filtered };
+}
 function renderReview() {
   const list = activeParts().filter(p => partStatus(p) === "review")
     .sort((a, b) => ((partTotal(b) !== b.q) - (partTotal(a) !== a.q)) || a.n.localeCompare(b.n));
   const matching = list.filter(p => partTotal(p) === p.q);
-  const shown = list.slice(0, UI.page * 40);
+  const f = filterParts(list, true);
+  const shown = f.list.slice(0, UI.page * 40);
   const rows = shown.map(p => {
     const place0 = partKeys(p)[0].slice(-1);
     const rc = UI.rcOpen === p.id && twoPlaces(p)
@@ -688,7 +738,7 @@ function renderReview() {
           <button class="sm" data-act="rcClose">إلغاء</button></div>`
       : `<div class="acts"><button class="sm go" data-act="approve" data-id="${esc(p.id)}">اعتماد</button>
           <button class="sm red" data-act="${twoPlaces(p) ? "rcOpen" : "rc"}" data-id="${esc(p.id)}" data-p="${place0}">إعادة عد</button></div>`;
-    return `<div class="rv">${headLine(p)}${entryLine(p, "S")}${entryLine(p, "W")}${rc}</div>`;
+    return `<div class="rv">${headLine(p)}${entryLine(p, "S")}${entryLine(p, "W")}${rcLines(p)}${rc}</div>`;
   }).join("");
   const bulk = UI.confirmBulk && matching.length
     ? `<div class="card" style="background:var(--surface-2)"><b>تأكيد اعتماد ${N(matching.length)} قطعة مطابقة</b>
@@ -699,8 +749,9 @@ function renderReview() {
       ${matching.length && !UI.confirmBulk ? `<button class="sm" data-act="bulkAsk">اعتماد المطابقة (${N(matching.length)})…</button>` : ""}</div>
     ${bulk}
     <p class="note">هنا القطع اللي فيها فرق بس. المطابقة تنعتمد تلقائياً وتلقاها في "المعتمدة". والقطعة اللي انعدت في مكان واحد وتنتظر الثاني ما تطلع لين يكتمل عدها.</p>
-    <div>${rows || `<p class="note">ما فيه قطع تنتظر المراجعة الحين.</p>`}</div>
-    ${list.length > shown.length ? `<button class="sm" data-act="more">عرض المزيد</button>` : ""}</div>`);
+    ${f.bar}
+    <div>${rows || `<p class="note">${list.length && f.filtered ? "ما فيه قطع بهالفلتر." : "ما فيه قطع تنتظر المراجعة الحين."}</p>`}</div>
+    ${f.list.length > shown.length ? `<button class="sm" data-act="more">عرض المزيد</button>` : ""}</div>`);
 }
 function rcButtons(p) {
   const place0 = partKeys(p)[0].slice(-1);
@@ -714,24 +765,23 @@ function rcButtons(p) {
 }
 function renderApproved() {
   const all = activeParts().filter(p => p.approved).sort((a, b) => (b.approved.at || 0) - (a.approved.at || 0));
-  const fastN = all.filter(isFast).length;
-  const list = UI.fastOnly ? all.filter(isFast) : all;
+  const f = filterParts(all, true), list = f.list;
   const shown = list.slice(0, UI.page * 40);
   const rows = shown.map(p => `<div class="rv">${headLine(p)}
       <div class="line"><span class="sub">${p.approved.auto ? "اعتماد تلقائي (مطابق)" : "اعتمدتها أنت"} · <span dir="ltr">${fmtTs(p.approved.at)}</span></span>${isFast(p) ? ` <span class="diff">⚠ سريعة</span>` : ""}</div>
-      ${entryLine(p, "S")}${entryLine(p, "W")}
+      ${entryLine(p, "S")}${entryLine(p, "W")}${rcLines(p)}
       <div class="acts">${p.expS || p.expW ? `<span class="sub">انصدرت · تلقاها في تبويب "المصدّرة"</span>`
         : `${rcButtons(p)}${UI.rcOpen === p.id && twoPlaces(p) ? "" : `<button class="sm" data-act="unapprove" data-id="${esc(p.id)}">رجّعها للمراجعة</button>`}`}</div></div>`).join("");
   mgrShell(`<div class="card"><h2>المعتمدة (${N(all.length)})</h2>
     <p class="note">آخر المعتمد فوق. ⏱ = الوقت بين العدّة واللي قبلها لنفس الموظف، والأحمر أقل من ${FAST_SEC} ثانية. "إعادة عد" ترجّعها للموظف، و"رجّعها للمراجعة" تخليها تنتظر قرارك.</p>
-    <label class="sub" style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="fastOnly" ${UI.fastOnly ? "checked" : ""}> السريعة بس (${N(fastN)})</label>
-    <div>${rows || `<p class="note">${UI.fastOnly ? "ما فيه قطع سريعة." : "ما فيه قطع معتمدة لين الحين."}</p>`}</div>
+    ${f.bar}
+    <div>${rows || `<p class="note">${all.length && f.filtered ? "ما فيه قطع بهالفلتر." : "ما فيه قطع معتمدة لين الحين."}</p>`}</div>
     ${list.length > shown.length ? `<button class="sm" data-act="more">عرض المزيد</button>` : ""}</div>`);
-  const cb = document.getElementById("fastOnly"); cb.addEventListener("change", () => { UI.fastOnly = cb.checked; UI.page = 1; render(); });
 }
 function renderExported() {
   const all = activeParts().filter(p => p.expS || p.expW).sort((a, b) => Math.max(b.expSAt || 0, b.expWAt || 0) - Math.max(a.expSAt || 0, a.expWAt || 0));
-  const shown = all.slice(0, UI.page * 40);
+  const f = filterParts(all, false);
+  const shown = f.list.slice(0, UI.page * 40);
   const expInfo = p => [
     p.expS ? `<span class="pill S">قائمة المحل</span> <span class="sub"><span dir="ltr">${fmtTs(p.expSAt)}</span>${p.expSQ != null ? ` · الكمية ${p.expSQ}` : ""}${p.expSLoc ? ` · <span class="mono" dir="ltr">${esc(p.expSLoc)}</span>` : ""}</span>` : "",
     p.expW ? `<span class="pill W">قائمة المستودع</span> <span class="sub"><span dir="ltr">${fmtTs(p.expWAt)}</span>${p.expWLoc ? ` · <span class="mono" dir="ltr">${esc(p.expWLoc)}</span>` : ""}</span>` : ""
@@ -749,11 +799,12 @@ function renderExported() {
   };
   const rows = shown.map(p => `<div class="rv">${headLine(p)}
       <div class="line">${expInfo(p)}</div>
-      ${entryLine(p, "S")}${entryLine(p, "W")}${acts(p)}</div>`).join("");
+      ${entryLine(p, "S")}${entryLine(p, "W")}${rcLines(p)}${acts(p)}</div>`).join("");
   mgrShell(`<div class="card"><h2>المصدّرة (${N(all.length)})</h2>
     <p class="note">كل قطعة صدّرتها، وآخر تصدير فوق. لو لاحظت شي: "إعادة عد" ترجّعها للموظف، و"رجّعها للمراجعة" تخليها تنتظر قرارك. وبعد ما تنعتمد من جديد، تطلع في التصدير الجاي للقائمتين مكتوب عليها "تصحيح".</p>
-    <div>${rows || `<p class="note">ما صدّرت شي لين الحين.</p>`}</div>
-    ${all.length > shown.length ? `<button class="sm" data-act="more">عرض المزيد</button>` : ""}</div>`);
+    ${f.bar}
+    <div>${rows || `<p class="note">${all.length && f.filtered ? "ما فيه قطع بهالفلتر." : "ما صدّرت شي لين الحين."}</p>`}</div>
+    ${f.list.length > shown.length ? `<button class="sm" data-act="more">عرض المزيد</button>` : ""}</div>`);
 }
 const HEAD = { S: ["رقم القطعة", "الكمية المعدودة", "كمية النظام", "منها على X", "منها بدون X", "موقع المحل", "وقت عد المحل", "وقت عد المستودع", "تصحيح"], W: ["رقم القطعة", "الموقع", "تصحيح"], P: ["الرقم بدون X"] };
 const FNAME = { S: "قائمة المحل", W: "قائمة المستودع", P: "أرقام المبرمج" };
@@ -875,6 +926,9 @@ app.addEventListener("click", async ev => {
       case "confirm": scrollTo(0, 0); return confirmEntry();
       case "tab": UI.tab = b.dataset.tab; UI.page = 1; UI.rcOpen = null; UI.confirmBulk = false; UI.xc = null; return render();
       case "more": UI.page++; return render();
+      case "who": UI.who = b.dataset.r; UI.page = 1; UI.rcOpen = null; UI.xc = null; return render();
+      case "flt": UI[b.dataset.k] = !UI[b.dataset.k]; UI.page = 1; UI.rcOpen = null; UI.xc = null; return render();
+      case "qClear": UI.q = ""; UI.qDraft = ""; UI.page = 1; UI.rcOpen = null; UI.xc = null; return render();
       case "approve": await store.approve([id]); toast("اعتُمدت"); return render();
       case "bulkAsk": UI.confirmBulk = true; return render();
       case "bulkNo": UI.confirmBulk = false; return render();
@@ -898,6 +952,19 @@ app.addEventListener("click", async ev => {
     toast(S.role === "admin" ? "ما تم. تأكد من النت وحاول مرة ثانية." : "Something went wrong. Try again.");
     render();
   }
+});
+// manager search box: typing only keeps the text; the search runs on Enter / "بحث" (so the phone keyboard isn't interrupted)
+app.addEventListener("input", ev => {
+  if (ev.target.id !== "mq") return;
+  UI.qDraft = ev.target.value;
+  if (!UI.qDraft && UI.q) { UI.q = ""; UI.page = 1; render(); }  // cleared with the box's own ✕
+});
+app.addEventListener("submit", ev => {
+  if (ev.target.id !== "mqForm") return;
+  ev.preventDefault();
+  UI.q = UI.qDraft.trim(); UI.page = 1; UI.rcOpen = null; UI.xc = null;
+  if (document.activeElement) document.activeElement.blur();
+  render();
 });
 app.addEventListener("keydown", ev => { if (ev.key === "Enter" && ev.target.matches("#qty,#otherLoc")) { ev.preventDefault(); app.querySelector('[data-act="done"]')?.click(); } });
 document.addEventListener("visibilitychange", () => { if (!document.hidden && store && store.touch) store.touch(); });
