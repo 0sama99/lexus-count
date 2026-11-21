@@ -144,7 +144,8 @@ const S = {
 };
 const UI = { view: "count", editKey: null, from: "count", draft: null, tab: "dash", page: 1, rcOpen: null,
   confirmBulk: false, inclOld: false, importPreview: null, importBusy: false, confirmSignOut: false,
-  who: "", fastOnly: false, rcOnly: false, q: "", qDraft: "" };  // manager filters + part-number search (review / approved / exported); kept when switching tabs
+  who: "", fastOnly: false, rcOnly: false, q: "", qDraft: "",
+  dq: "", dqDraft: "", mv: null };  // dashboard search (any part) + pending move  // manager filters + part-number search (review / approved / exported); kept when switching tabs
 addEventListener("online", () => { S.online = true; store.touch && store.touch(); render(); });
 addEventListener("offline", () => { S.online = false; render(); });
 
@@ -189,6 +190,22 @@ function rcSnaps(id, places) {
   }
   return out;
 }
+/* moving a part between the shop and the warehouse (manager only).
+   to = { shop: true/false, wh: "" | "w1" | "w2" }. A place that is removed, or whose warehouse employee changes,
+   loses its entry; a counted entry is kept on the part as "before" (rcHist, moved: true). The new place goes first
+   in that employee's list (negative order). manual: true keeps the move when app_data.json is uploaded again. */
+function movePlan(p, to) {
+  const dropS = !!p.shop && !to.shop, dropW = !!p.wh && to.wh !== p.wh;
+  const drop = (dropS ? ["S"] : []).concat(dropW ? ["W"] : []);
+  const first = -Math.floor(Date.now() / 1000);
+  const upd = { shop: !!to.shop, wh: to.wh || null, manual: true };
+  if (to.shop && !p.shop) upd.os = first;
+  if (to.wh && to.wh !== p.wh) upd.ow = first;
+  const mv = { at: Date.now(), by: S.email || "", from: { shop: !!p.shop, wh: p.wh || "" }, to: { shop: !!to.shop, wh: to.wh || "" } };
+  const snaps = rcSnaps(p.id, drop).map(x => Object.assign(x, { moved: true }));
+  return { drop, upd, mv, snaps };
+}
+const placeTxt = x => [x.shop ? "المحل" : "", x.wh ? `المستودع (${empName(x.wh)})` : ""].filter(Boolean).join(" + ");
 let store;
 
 /* ----- demo (no Firebase): fake parts, nothing leaves the browser ----- */
@@ -253,7 +270,8 @@ function demoStore() {
     async recount(id, places) { const p = S.parts.get(id), snaps = rcSnaps(id, places); for (const pl of places) { const e = S.entries.get(id + "_" + pl); if (e) e.status = "recount"; } Object.assign(p, { approved: null, hold: false }, snaps.length ? { rcHist: (p.rcHist || []).concat(snaps) } : {}); log("recount", id + " " + places.join("+")); render(); },
     async markExported(snaps, kind) { snaps.forEach(s => Object.assign(S.parts.get(s.id), kind === "S" ? { expS: true, expSAt: Date.now(), expSQ: s.q, expSLoc: s.loc || "" } : { expW: true, expWAt: Date.now(), expWLoc: s.loc || "" })); log("export", kind + " " + snaps.length); render(); },
     async reopenExported(id, places) { const p = S.parts.get(id), upd = reopenUpdate(p, places), snaps = rcSnaps(id, places); if (snaps.length) upd.rcHist = (p.rcHist || []).concat(snaps); for (const pl of places) { const e = S.entries.get(id + "_" + pl); if (e) e.status = "recount"; } Object.assign(p, upd); log(places.length ? "recount" : "unapprove", id + " بعد التصدير"); render(); },
-    async importData(d) { const keep = new Map(S.parts); put(buildParts(d).map(p => Object.assign({}, keep.get(p.id) ? { approved: keep.get(p.id).approved, expS: keep.get(p.id).expS, expW: keep.get(p.id).expW } : {}, p))); for (const id of keep.keys()) if (!S.parts.has(id)) S.parts.set(id, Object.assign(keep.get(id), { gone: true })); log("import", d.parts.length + " قطعة"); render(); },
+    async movePart(id, to) { const p = S.parts.get(id), m = movePlan(p, to); for (const pl of m.drop) S.entries.delete(id + "_" + pl); Object.assign(p, m.upd, { mvHist: (p.mvHist || []).concat([m.mv]) }, m.snaps.length ? { rcHist: (p.rcHist || []).concat(m.snaps) } : {}); log("move", id + ": " + placeTxt(m.mv.from) + " ← " + placeTxt(m.mv.to)); render(); },
+    async importData(d) { const keep = new Map(S.parts); put(buildParts(d).map(p => { const k = keep.get(p.id); return Object.assign({}, p, k ? { approved: k.approved, expS: k.expS, expW: k.expW, rcHist: k.rcHist, mvHist: k.mvHist } : {}, k && k.manual ? { manual: true, shop: k.shop, wh: k.wh, os: k.os, ow: k.ow } : {}); })); for (const id of keep.keys()) if (!S.parts.has(id)) S.parts.set(id, Object.assign(keep.get(id), { gone: true })); log("import", d.parts.length + " قطعة"); render(); },
     async setDays(n) { S.settings.days = n; render(); }
   };
 }
@@ -366,14 +384,24 @@ async function firebaseStore() {
     async importData(d) {
       const list = buildParts(d), ids = new Set(list.map(p => p.id));
       const ops = list.map(p => b => {
-        const base = { n: p.n, p: p.p, q: p.q, qx: p.qx, qp: p.qp, s: p.s, w: p.w, shop: p.shop, wh: p.wh, os: p.os, ow: p.ow, gone: false, importedAt: F.serverTimestamp() };
-        if (!S.parts.has(p.id)) Object.assign(base, { approved: null, expS: false, expW: false });
+        const cur = S.parts.get(p.id);
+        const base = { n: p.n, p: p.p, q: p.q, qx: p.qx, qp: p.qp, s: p.s, w: p.w, gone: false, importedAt: F.serverTimestamp() };
+        if (!(cur && cur.manual)) Object.assign(base, { shop: p.shop, wh: p.wh, os: p.os, ow: p.ow });  // a part moved by hand keeps its places
+        if (!cur) Object.assign(base, { approved: null, expS: false, expW: false });
         b.set(F.doc(db, "parts", p.id), base, { merge: true });
       });
       for (const id of S.parts.keys()) if (!ids.has(id)) ops.push(b => b.update(F.doc(db, "parts", id), { gone: true }));
       await batches(ops);
       await F.setDoc(F.doc(db, "settings", "main"), { importedAt: F.serverTimestamp(), importedParts: list.length }, { merge: true });
       log("import", list.length + " قطعة");
+    },
+    async movePart(id, to) {
+      const p = S.parts.get(id), m = movePlan(p, to), upd = Object.assign({}, m.upd, { mvHist: F.arrayUnion(m.mv) });
+      if (m.snaps.length) upd.rcHist = F.arrayUnion(...m.snaps);
+      const ops = m.drop.filter(pl => S.entries.has(id + "_" + pl)).map(pl => b => b.delete(F.doc(db, "entries", id + "_" + pl)));
+      ops.push(b => b.update(F.doc(db, "parts", id), upd));
+      await batches(ops);
+      log("move", id + ": " + placeTxt(m.mv.from) + " ← " + placeTxt(m.mv.to));
     },
     async setDays(n) { await F.setDoc(F.doc(db, "settings", "main"), { days: n }, { merge: true }); }
   };
@@ -593,7 +621,7 @@ function empEmail(role) { for (const [em, r] of S.roles) if (r.role === role) re
 function mgrShell(body) {
   const tabs = [["dash", "المتابعة"], ["review", "المراجعة"], ["approved", "المعتمدة"], ["exported", "المصدّرة"], ["export", "التصدير"], ["data", "البيانات"]];
   const c = counts();
-  const ae = document.activeElement, keepQ = ae && ae.id === "mq" ? [ae.selectionStart, ae.selectionEnd] : null;
+  const ae = document.activeElement, keepQ = ae && (ae.id === "mq" || ae.id === "dq") ? [ae.id, ae.selectionStart, ae.selectionEnd] : null;
   app.innerHTML = `<div class="wrap wide" dir="rtl" lang="ar">
     <div class="brandband"><img src="logo-white.png" alt="الموسى" style="height:46px"><div><h1>جرد قطع لكزس</h1><div class="sub">لوحة المدير ${store.demo ? "· تجربة" : ""}</div></div>
       <button class="chipbtn" data-act="signOutNow">${store.demo ? "تبديل المستخدم" : "خروج"}</button></div>
@@ -603,7 +631,7 @@ function mgrShell(body) {
     ${body}
     <p class="sig">إعداد: أسامة</p>
   </div>`;
-  if (keepQ) { const m = document.getElementById("mq"); if (m) { m.focus(); try { m.setSelectionRange(keepQ[0], keepQ[1]); } catch (e) {} } }
+  if (keepQ) { const m = document.getElementById(keepQ[0]); if (m) { m.focus(); try { m.setSelectionRange(keepQ[1], keepQ[2]); } catch (e) {} } }
 }
 /* working hours: an employee's counts split into sessions wherever two counts are more than SESSION_GAP_MIN apart
    (noon break and after closing are separate sessions). Session time = first to last count + 1 minute for the first part. */
@@ -633,6 +661,65 @@ function hoursLine(role) {
   const days = [...byDay.entries()].map(([k, sec]) => `${AR_DAYS[new Date(k).getDay()]} ${durTxt(sec)}`).join(" · ");
   return `<div class="sub">⏰ اليوم: ${todayS.length ? todayS.map(s => `<bdi>${tmAr(s.start)}</bdi> – <bdi>${tmAr(s.end)}</bdi>`).join(" · ") + ` · <b>${durTxt(todayS.reduce((a, s) => a + s.sec, 0))}</b>` : "ما اشتغل"} · المجموع: <b>${durTxt(week)}</b></div>
     ${byDay.size > 1 ? `<div class="sub">${days}</div>` : ""}`;
+}
+/* المتابعة: find any part (counted or not), see where it stands, and move it between the shop and the warehouse */
+const STATUS_AR = { remaining: "باقية", waiting: "تنتظر المكان الثاني", review: "تنتظر مراجعتك", approved: "معتمدة" };
+function partStatusAr(p) {
+  if (p.expS || p.expW) return "انصدرت";
+  if (!p.approved && partKeys(p).some(k => S.entries.get(k)?.status === "recount")) return "رجعت لإعادة العد";
+  return STATUS_AR[partStatus(p)];
+}
+function moveOptions(p) {
+  const other = p.wh === "w1" ? "w2" : "w1", o = [];
+  const opt = (to, label) => o.push(`<button class="sm" data-act="mvAsk" data-id="${esc(p.id)}" data-to="${to.shop ? 1 : 0}:${to.wh || ""}">${label}</button>`);
+  if (p.shop && !p.wh) {
+    o.push(`<span class="sub">حوّلها للمستودع:</span>`);
+    for (const r of ["w1", "w2"]) { opt({ shop: false, wh: r }, `نقل ← ${esc(empName(r))}`); opt({ shop: true, wh: r }, `إضافة ← ${esc(empName(r))}`); }
+  } else if (!p.shop && p.wh) {
+    o.push(`<span class="sub">حوّلها للمحل:</span>`);
+    opt({ shop: true, wh: "" }, `نقل ← ${esc(empName("shop"))}`); opt({ shop: true, wh: p.wh }, `إضافة ← ${esc(empName("shop"))}`);
+    opt({ shop: false, wh: other }, `غيّر موظف المستودع ← ${esc(empName(other))}`);
+  } else if (p.shop && p.wh) {
+    opt({ shop: false, wh: p.wh }, "شيلها من المحل"); opt({ shop: true, wh: "" }, "شيلها من المستودع");
+    opt({ shop: true, wh: other }, `غيّر موظف المستودع ← ${esc(empName(other))}`);
+  }
+  return `<div class="acts">${o.join("")}</div>`;
+}
+function moveConfirm(p) {
+  const m = UI.mv, to = m.to;
+  const dropS = p.shop && !to.shop, dropW = p.wh && to.wh !== p.wh;
+  const lost = [dropS && "S", dropW && "W"].filter(Boolean).map(pl => S.entries.get(p.id + "_" + pl)).filter(Boolean);
+  const gets = [!p.shop && to.shop && "shop", to.wh && to.wh !== p.wh && to.wh].filter(Boolean);
+  const loses = [dropS && "shop", dropW && p.wh].filter(Boolean);
+  return `<div class="card" style="background:var(--surface-2);gap:8px"><b>${placeTxt({ shop: p.shop, wh: p.wh })} ← ${placeTxt(to)}</b>
+    ${gets.length ? `<p class="note">تطلع أول قائمة: ${gets.map(r => `<b>${esc(empName(r))}</b>`).join(" و ")}، ويكتب الموقع بزر Other لو ما لها موقع عنده.</p>` : ""}
+    ${loses.length ? `<p class="note">تنشال من قائمة: ${loses.map(r => `<b>${esc(empName(r))}</b>`).join(" و ")}. <b>تأكد إن جواله مكتوب فيه All sent ✓</b> قبل، عشان أي عدّة على جواله لهالقطعة ما تضيع.</p>` : ""}
+    ${lost.map(e => `<p class="note diff">عدّه ${e.status === "counted" ? `<b><bdi dir="ltr">${e.q}</bdi></b>${e.loc ? ` على <bdi class="mono" dir="ltr">${esc(e.loc)}</bdi>` : ""} ينحفظ كـ"قبل:" وما يدخل في الإجمالي` : "اللي رجع لإعادة العد ينلغى"}.</p>`).join("")}
+    <div class="acts"><button class="sm go" data-act="mvYes">نعم، حوّلها</button><button class="sm" data-act="mvNo">إلغاء</button></div></div>`;
+}
+function dashSearch() {
+  const q = normNo(UI.dq);
+  const found = q ? [...S.parts.values()].filter(p => !p.gone && matchNo(p, q)).sort((a, b) => a.n.localeCompare(b.n)) : [];
+  const cards = found.slice(0, 20).map(p => {
+    const sysLocs = locsOf(p).map(x => `<span class="pill ${x.t}"><span class="mono" dir="ltr">${esc(x.l)}</span></span>`).join(" ") || `<span class="sub">ما لها موقع في النظام</span>`;
+    const who = [p.shop && `المحل: <b>${esc(empName("shop"))}</b>`, p.wh && `المستودع: <b>${esc(empName(p.wh))}</b>`].filter(Boolean).join(" · ");
+    const locked = p.approved || p.expS || p.expW;
+    const tail = UI.mv && UI.mv.id === p.id ? moveConfirm(p)
+      : locked ? `<p class="note">${p.expS || p.expW ? "انصدرت" : "معتمدة"}، فما تتحول. رجّعها للمراجعة أول من تبويب "${p.expS || p.expW ? "المصدّرة" : "المعتمدة"}".</p>`
+      : moveOptions(p);
+    return `<div class="rv"><div class="bar"><b class="mono" dir="ltr">${esc(p.n)}</b><span class="pill" style="border-color:var(--line)">${partStatusAr(p)}</span></div>
+      <div class="line"><span>النظام <b><bdi dir="ltr">${p.q}</bdi></b></span><span class="sub">على <bdi>X</bdi>: <bdi dir="ltr">${p.qx}</bdi></span><span class="sub">بدون <bdi>X</bdi>: <bdi dir="ltr">${p.qp}</bdi></span></div>
+      <div class="line"><span class="sub">مواقع النظام:</span> ${sysLocs}</div>
+      <div class="line"><span class="sub">المسؤول:</span> <span>${who}</span></div>
+      ${entryLine(p, "S")}${entryLine(p, "W")}${rcLines(p)}${tail}</div>`;
+  }).join("");
+  return `<div class="card"><h2>ابحث عن قطعة</h2>
+    <form id="dqForm" role="search" style="display:flex;gap:8px;align-items:center">
+      <input id="dq" type="search" dir="ltr" autocomplete="off" autocapitalize="characters" spellcheck="false" enterkeyhint="search" aria-label="ابحث عن أي قطعة" placeholder="أي قطعة من الـ${N(activeParts().length)}"
+        value="${esc(UI.dqDraft)}" style="flex:1;min-width:0;height:44px;border:1.5px solid var(--line);border-radius:10px;padding:0 12px;background:var(--surface);color:var(--fg);font-size:16px;font-family:var(--font-mono)">
+      <button class="sm go" type="submit">بحث</button>${UI.dq ? `<button class="sm" type="button" data-act="dqClear">مسح</button>` : ""}</form>
+    ${UI.dq ? (found.length ? `<p class="sub" style="margin:0">${N(found.length)} قطعة${found.length > 20 ? " · يطلع أول 20، زيد الرقم عشان تضيّق" : ""}</p><div>${cards}</div>` : `<p class="note">ما لقيت قطعة فيها <bdi class="mono" dir="ltr">${esc(UI.dq)}</bdi> في قائمة الجرد.</p>`) : `<p class="note">تلقى أي قطعة حتى لو ما انعدّت، وتشوف حالتها، وتقدر تحوّلها بين المحل والمستودع.</p>`}
+  </div>`;
 }
 function renderDash() {
   if (!activeParts().length) return mgrShell(`<div class="card"><h2>ما فيه بيانات لين الحين</h2><p class="note">روح لتبويب "البيانات" وارفع ملف app_data.json.</p><button class="sm go" data-act="tab" data-tab="data">البيانات</button></div>`);
@@ -665,6 +752,7 @@ function renderDash() {
       <div class="stat"><div class="sub">تنتظر مراجعتك</div><div class="n">${N(c.review)}</div></div>
       <div class="stat"><div class="sub">معتمدة</div><div class="n">${N(c.approved)}</div></div>
     </div>
+    ${dashSearch()}
     <h2>الموظفين</h2>${emp}
     <p class="note">آخر اتصال = آخر مرة وصل فيها جوال الموظف للنت. العدّات اللي على جواله وما انرسلت ما تبين لك لين يتصل.</p>
     <p class="note">⏰ ساعات الشغل تقريبية من أوقات العدّ: أي فاصل أكثر من ${SESSION_GAP_MIN} دقيقة بين عدّتين يعتبر استراحة. وقت المشي والتجهيز قبل أول عدّة ما ينحسب، والقطعة اللي رجعت لإعادة العد ينحسب وقت عدّها الأخير بس.</p>`);
@@ -689,10 +777,11 @@ function headLine(p) {
     <span>النظام <b>${p.q}</b> · الإجمالي <b>${tot}</b> · ${d === 0 ? `<span class="same">مطابق</span>` : `<span class="diff">فرق ${d > 0 ? "+" : ""}${d}</span>`}</span></div>`;
 }
 /* recount history: the count each recount replaced (part.rcHist), shown as "before" */
-const wasRecounted = p => !!(p.rcHist && p.rcHist.length);
+const wasRecounted = p => !!(p.rcHist && p.rcHist.some(h => !h.moved));
 function rcLines(p) {
-  if (!wasRecounted(p)) return "";
-  return p.rcHist.map(h => `<div class="line"><span class="diff">⟲ أُعيد عدها</span><span class="sub">قبل:</span>
+  const mv = (p.mvHist || []).map(m => `<div class="line"><span class="diff">⇄ انحولت</span><span class="sub">${placeTxt(m.from)} ← ${placeTxt(m.to)}</span><span class="sub" dir="ltr" style="font-variant-numeric:tabular-nums">🕒 ${fmtTs(m.at)}</span></div>`).join("");
+  if (!(p.rcHist && p.rcHist.length)) return mv;
+  return mv + p.rcHist.map(h => `<div class="line"><span class="diff">${h.moved ? "⇄ انشال عدّه" : "⟲ أُعيد عدها"}</span><span class="sub">قبل:</span>
     <span class="pill ${h.place}">${h.place === "S" ? "المحل" : "المستودع"}</span><b>${h.q}</b>
     ${h.loc ? `<span class="pill ${h.lt || h.place}"><span class="mono" dir="ltr">${esc(h.loc)}</span></span>` : `<span class="sub">بدون موقع</span>`}
     <span class="sub">${esc(empName(h.role))}</span><span class="sub" dir="ltr" style="font-variant-numeric:tabular-nums">🕒 ${fmtTs(h.at)}</span></div>`).join("");
@@ -855,7 +944,7 @@ function renderData() {
   const pv = UI.importPreview;
   const staff = [...S.roles.entries()].map(([em, r]) => `<div class="row"><div><b>${esc(r.name || em)}</b><div class="meta" dir="ltr">${esc(em)}</div></div>
       <span class="${r.role === "admin" ? "sub" : "pill " + (ROLES[r.role]?.place || "")}">${r.role === "admin" ? "المدير" : esc(ROLES[r.role]?.ar || r.role)}</span></div>`).join("");
-  const logRows = S.log.slice(0, 30).map(l => `<div class="row"><div><b>${esc({ approve: "اعتماد", unapprove: "إلغاء اعتماد", recount: "إعادة عد", export: "تصدير", import: "رفع بيانات" }[l.action] || l.action)}</b> <span class="sub">${esc(l.detail || "")}</span></div><span class="sub" dir="ltr">${fmtTs(l.at)}</span></div>`).join("");
+  const logRows = S.log.slice(0, 30).map(l => `<div class="row"><div><b>${esc({ approve: "اعتماد", unapprove: "إلغاء اعتماد", recount: "إعادة عد", export: "تصدير", import: "رفع بيانات", move: "تحويل" }[l.action] || l.action)}</b> <span class="sub">${esc(l.detail || "")}</span></div><span class="sub" dir="ltr">${fmtTs(l.at)}</span></div>`).join("");
   mgrShell(`
     <div class="card"><h2>رفع البيانات</h2>
       <p class="note">ارفع ملف app_data.json اللي يجهزه Claude من ملفات الإكسل. الرفع الثاني يحدّث الكميات والمواقع، وما يمسح العدّ ولا الاعتمادات.</p>
@@ -903,7 +992,7 @@ function render() {
   return renderCount();
 }
 let lastRender = 0;
-const GUARDED = new Set(["approve", "bulkAsk", "bulkYes", "unapprove", "rc", "rcOpen", "confirm", "done", "xAsk", "xYes"]);
+const GUARDED = new Set(["approve", "bulkAsk", "bulkYes", "unapprove", "rc", "rcOpen", "confirm", "done", "xAsk", "xYes", "mvAsk", "mvYes"]);
 app.addEventListener("click", async ev => {
   const b = ev.target.closest("[data-act]"); if (!b) return;
   const a = b.dataset.act;
@@ -924,11 +1013,17 @@ app.addEventListener("click", async ev => {
       case "done": if (!validateDraft()) { UI.noFocus = true; return render(); } UI.view = "summary"; scrollTo(0, 0); return render();
       case "edit": UI.view = "count"; UI.noFocus = true; return render();
       case "confirm": scrollTo(0, 0); return confirmEntry();
-      case "tab": UI.tab = b.dataset.tab; UI.page = 1; UI.rcOpen = null; UI.confirmBulk = false; UI.xc = null; return render();
+      case "tab": UI.tab = b.dataset.tab; UI.page = 1; UI.rcOpen = null; UI.confirmBulk = false; UI.xc = null; UI.mv = null; return render();
       case "more": UI.page++; return render();
       case "who": UI.who = b.dataset.r; UI.page = 1; UI.rcOpen = null; UI.xc = null; return render();
       case "flt": UI[b.dataset.k] = !UI[b.dataset.k]; UI.page = 1; UI.rcOpen = null; UI.xc = null; return render();
       case "qClear": UI.q = ""; UI.qDraft = ""; UI.page = 1; UI.rcOpen = null; UI.xc = null; return render();
+      case "dqClear": UI.dq = ""; UI.dqDraft = ""; UI.mv = null; return render();
+      case "mvAsk": { const [sh, wh] = b.dataset.to.split(":"); UI.mv = { id, to: { shop: sh === "1", wh } }; return render(); }
+      case "mvNo": UI.mv = null; return render();
+      case "mvYes": { const m = UI.mv; UI.mv = null; if (!m) return render(); const p = S.parts.get(m.id);
+        if (!p || p.approved || p.expS || p.expW) { toast("ما تتحول وهي معتمدة"); return render(); }
+        await store.movePart(m.id, m.to); toast("انحولت"); return render(); }
       case "approve": await store.approve([id]); toast("اعتُمدت"); return render();
       case "bulkAsk": UI.confirmBulk = true; return render();
       case "bulkNo": UI.confirmBulk = false; return render();
@@ -955,14 +1050,14 @@ app.addEventListener("click", async ev => {
 });
 // manager search box: typing only keeps the text; the search runs on Enter / "بحث" (so the phone keyboard isn't interrupted)
 app.addEventListener("input", ev => {
-  if (ev.target.id !== "mq") return;
-  UI.qDraft = ev.target.value;
-  if (!UI.qDraft && UI.q) { UI.q = ""; UI.page = 1; render(); }  // cleared with the box's own ✕
+  const k = { mq: "q", dq: "dq" }[ev.target.id]; if (!k) return;  // mq = review/approved/exported, dq = المتابعة
+  UI[k + "Draft"] = ev.target.value;
+  if (!UI[k + "Draft"] && UI[k]) { UI[k] = ""; UI.page = 1; UI.mv = null; render(); }  // cleared with the box's own ✕
 });
 app.addEventListener("submit", ev => {
-  if (ev.target.id !== "mqForm") return;
+  const k = { mqForm: "q", dqForm: "dq" }[ev.target.id]; if (!k) return;
   ev.preventDefault();
-  UI.q = UI.qDraft.trim(); UI.page = 1; UI.rcOpen = null; UI.xc = null;
+  UI[k] = UI[k + "Draft"].trim(); UI.page = 1; UI.rcOpen = null; UI.xc = null; UI.mv = null;
   if (document.activeElement) document.activeElement.blur();
   render();
 });
