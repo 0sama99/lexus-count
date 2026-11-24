@@ -190,6 +190,18 @@ function rcSnaps(id, places) {
   }
   return out;
 }
+/* undo a recount pressed by mistake: a recount only flips the entry's status, so the employee's old count is still there.
+   undoPlaces = the places of a part that went back for recount and still hold that old count (the employee hasn't recounted).
+   undoRcHist = rcHist without the "before" line that recount added. */
+const undoPlaces = p => partKeys(p).filter(k => { const e = S.entries.get(k); return e && e.status === "recount" && typeof e.q === "number" && !!e.countedAt; }).map(k => k.slice(-1));
+function undoRcHist(p, places) {
+  const h = (p.rcHist || []).slice();
+  for (const pl of places) {
+    const e = S.entries.get(p.id + "_" + pl);
+    for (let i = h.length - 1; i >= 0; i--) { const x = h[i]; if (!x.moved && x.place === pl && x.q === e.q && (x.at || null) === (e.countedAt || null)) { h.splice(i, 1); break; } }
+  }
+  return h;
+}
 /* moving a part between the shop and the warehouse (manager only).
    to = { shop: true/false, wh: "" | "w1" | "w2" }. A place that is removed, or whose warehouse employee changes,
    loses its entry; a counted entry is kept on the part as "before" (rcHist, moved: true). The new place goes first
@@ -268,6 +280,7 @@ function demoStore() {
     async approve(ids, auto) { ids.forEach(id => S.parts.get(id).approved = { at: Date.now(), by: S.email, auto: !!auto }); if (!auto) log("approve", ids.length + " قطعة"); render(); },
     async unapprove(id) { Object.assign(S.parts.get(id), { approved: null, hold: true }); log("unapprove", id); render(); },
     async recount(id, places) { const p = S.parts.get(id), snaps = rcSnaps(id, places); for (const pl of places) { const e = S.entries.get(id + "_" + pl); if (e) e.status = "recount"; } Object.assign(p, { approved: null, hold: false }, snaps.length ? { rcHist: (p.rcHist || []).concat(snaps) } : {}); log("recount", id + " " + places.join("+")); render(); },
+    async undoRecount(id, places) { const p = S.parts.get(id), h = undoRcHist(p, places); for (const pl of places) { const e = S.entries.get(id + "_" + pl); e.status = "counted"; delete e.recountAt; } Object.assign(p, { hold: true, rcHist: h }); log("undoRecount", id + " " + places.join("+")); render(); },
     async markExported(snaps, kind) { snaps.forEach(s => Object.assign(S.parts.get(s.id), kind === "S" ? { expS: true, expSAt: Date.now(), expSQ: s.q, expSLoc: s.loc || "" } : { expW: true, expWAt: Date.now(), expWLoc: s.loc || "" })); log("export", kind + " " + snaps.length); render(); },
     async reopenExported(id, places) { const p = S.parts.get(id), upd = reopenUpdate(p, places), snaps = rcSnaps(id, places); if (snaps.length) upd.rcHist = (p.rcHist || []).concat(snaps); for (const pl of places) { const e = S.entries.get(id + "_" + pl); if (e) e.status = "recount"; } Object.assign(p, upd); log(places.length ? "recount" : "unapprove", id + " بعد التصدير"); render(); },
     async movePart(id, to) { const p = S.parts.get(id), m = movePlan(p, to); for (const pl of m.drop) S.entries.delete(id + "_" + pl); Object.assign(p, m.upd, { mvHist: (p.mvHist || []).concat([m.mv]) }, m.snaps.length ? { rcHist: (p.rcHist || []).concat(m.snaps) } : {}); log("move", id + ": " + placeTxt(m.mv.from) + " ← " + placeTxt(m.mv.to)); render(); },
@@ -363,6 +376,13 @@ async function firebaseStore() {
       const ops = places.map(pl => b => b.set(F.doc(db, "entries", id + "_" + pl), { status: "recount", recountAt: F.serverTimestamp() }, { merge: true }));
       ops.push(b => b.update(F.doc(db, "parts", id), upd));
       await batches(ops); log("recount", id + " " + places.join("+"));
+    },
+    async undoRecount(id, places) {
+      // the old count is still on the entry: flip it back to "counted", drop the "before" line, and keep the part in review (hold)
+      const p = S.parts.get(id), h = undoRcHist(p, places);
+      const ops = places.map(pl => b => b.update(F.doc(db, "entries", id + "_" + pl), { status: "counted", recountAt: F.deleteField() }));
+      ops.push(b => b.update(F.doc(db, "parts", id), { hold: true, rcHist: h }));
+      await batches(ops); log("undoRecount", id + " " + places.join("+"));
     },
     async markExported(snaps, kind) {
       // snaps: [{ id, q, loc }] = what went into the Excel file, kept so a later correction can show "before"
@@ -706,7 +726,7 @@ function dashSearch() {
     const locked = p.approved || p.expS || p.expW;
     const tail = UI.mv && UI.mv.id === p.id ? moveConfirm(p)
       : locked ? `<p class="note">${p.expS || p.expW ? "انصدرت" : "معتمدة"}، فما تتحول. رجّعها للمراجعة أول من تبويب "${p.expS || p.expW ? "المصدّرة" : "المعتمدة"}".</p>`
-      : moveOptions(p);
+      : undoBlock(p) + (UI.ux === p.id ? "" : moveOptions(p));
     return `<div class="rv"><div class="bar"><b class="mono" dir="ltr">${esc(p.n)}</b><span class="pill" style="border-color:var(--line)">${partStatusAr(p)}</span></div>
       <div class="line"><span>النظام <b><bdi dir="ltr">${p.q}</bdi></b></span><span class="sub">على <bdi>X</bdi>: <bdi dir="ltr">${p.qx}</bdi></span><span class="sub">بدون <bdi>X</bdi>: <bdi dir="ltr">${p.qp}</bdi></span></div>
       <div class="line"><span class="sub">مواقع النظام:</span> ${sysLocs}</div>
@@ -786,6 +806,21 @@ function rcLines(p) {
     ${h.loc ? `<span class="pill ${h.lt || h.place}"><span class="mono" dir="ltr">${esc(h.loc)}</span></span>` : `<span class="sub">بدون موقع</span>`}
     <span class="sub">${esc(empName(h.role))}</span><span class="sub" dir="ltr" style="font-variant-numeric:tabular-nums">🕒 ${fmtTs(h.at)}</span></div>`).join("");
 }
+/* "إلغاء إعادة العد": button, then a confirm that shows exactly which count comes back */
+function undoBlock(p) {
+  const pls = undoPlaces(p);
+  if (!pls.length || p.approved) return "";
+  if (UI.ux !== p.id) return `<div class="acts"><button class="sm" data-act="uxAsk" data-id="${esc(p.id)}">↶ إلغاء إعادة العد</button></div>`;
+  const back = pls.map(pl => { const e = S.entries.get(p.id + "_" + pl);
+    return `<div class="line"><span class="pill ${pl}">${pl === "S" ? "المحل" : "المستودع"}</span><b>${e.q}</b>
+      ${e.loc ? `<span class="pill ${e.lt || pl}"><span class="mono" dir="ltr">${esc(e.loc)}</span></span>` : `<span class="sub">بدون موقع</span>`}
+      <span class="sub">${esc(empName(e.role))}</span><span class="sub" dir="ltr" style="font-variant-numeric:tabular-nums">🕒 ${fmtTs(e.countedAt)}</span></div>`; }).join("");
+  const who = [...new Set(pls.map(pl => S.entries.get(p.id + "_" + pl).role))].map(r => `<b>${esc(empName(r))}</b>`).join(" و ");
+  return `<div class="card" style="background:var(--surface-2);gap:8px"><b>ترجع هالعدّة زي ما كانت:</b>${back}
+    <p class="note">وتطلع لك في "المراجعة" تعتمدها بنفسك، وتنشال من قائمة ${who}.</p>
+    <p class="note diff">تأكد إن ${who} ما عدّها، وإن جواله مكتوب فيه <bdi dir="ltr">All sent ✓</bdi>. لو عدّها وهو بدون نت واعتمدتها قبل ما توصل عدّته، عدّته الجديدة بتنرفض.</p>
+    <div class="acts"><button class="sm go" data-act="uxYes" data-id="${esc(p.id)}">نعم، ألغِ إعادة العد</button><button class="sm" data-act="uxNo">لا</button></div></div>`;
+}
 /* manager filters for review / approved / exported: person (who counted it), fast counts, recounted.
    A part counted in both places shows under both people. */
 const countedBy = (p, role) => partKeys(p).some(k => { const e = S.entries.get(k); return counted(e) && e.role === role; });
@@ -833,7 +868,15 @@ function renderReview() {
     ? `<div class="card" style="background:var(--surface-2)"><b>تأكيد اعتماد ${N(matching.length)} قطعة مطابقة</b>
         <div class="mono" dir="ltr" style="font-size:14px;display:flex;flex-wrap:wrap;gap:6px 14px">${matching.map(p => esc(p.n)).join("<span> </span>")}</div>
         <div class="acts"><button class="sm go" data-act="bulkYes">نعم، اعتمدها</button><button class="sm" data-act="bulkNo">إلغاء</button></div></div>` : "";
-  mgrShell(`<div class="card">
+  // parts sent back for recount that the employee hasn't recounted yet: here so a recount pressed by mistake can be undone
+  const rcAll = activeParts().filter(p => !p.approved && undoPlaces(p).length).sort((a, b) => a.n.localeCompare(b.n));
+  const rcList = rcAll.filter(p => matchNo(p, normNo(UI.q)));
+  const rcCard = rcAll.length ? `<div class="card" style="gap:8px">
+    <div class="bar"><b>رجعت لإعادة العد وما انعدّت (${N(rcAll.length)})</b><button class="sm" data-act="rcList">${UI.rcList ? "إخفاء" : "عرض"}</button></div>
+    ${UI.rcList ? `<p class="note">تنتظر الموظف. لو رجّعت قطعة بالغلط، "إلغاء إعادة العد" يرجّع عدّها القديم وتطلع لك هنا تحت في المراجعة.${UI.q ? ` (البحث شغّال هنا بعد: ${N(rcList.length)})` : ""}</p>
+      ${rcList.map(p => `<div class="rv"><div class="bar"><b class="mono" dir="ltr">${esc(p.n)}</b><span>النظام <b><bdi dir="ltr">${p.q}</bdi></b></span></div>${entryLine(p, "S")}${entryLine(p, "W")}${rcLines(p)}${undoBlock(p)}</div>`).join("")}` : ""}
+  </div>` : "";
+  mgrShell(`${rcCard}<div class="card">
     <div class="bar"><h2>تنتظر مراجعتك (${N(list.length)})</h2>
       ${matching.length && !UI.confirmBulk ? `<button class="sm" data-act="bulkAsk">اعتماد المطابقة (${N(matching.length)})…</button>` : ""}</div>
     ${bulk}
@@ -944,7 +987,7 @@ function renderData() {
   const pv = UI.importPreview;
   const staff = [...S.roles.entries()].map(([em, r]) => `<div class="row"><div><b>${esc(r.name || em)}</b><div class="meta" dir="ltr">${esc(em)}</div></div>
       <span class="${r.role === "admin" ? "sub" : "pill " + (ROLES[r.role]?.place || "")}">${r.role === "admin" ? "المدير" : esc(ROLES[r.role]?.ar || r.role)}</span></div>`).join("");
-  const logRows = S.log.slice(0, 30).map(l => `<div class="row"><div><b>${esc({ approve: "اعتماد", unapprove: "إلغاء اعتماد", recount: "إعادة عد", export: "تصدير", import: "رفع بيانات", move: "تحويل" }[l.action] || l.action)}</b> <span class="sub">${esc(l.detail || "")}</span></div><span class="sub" dir="ltr">${fmtTs(l.at)}</span></div>`).join("");
+  const logRows = S.log.slice(0, 30).map(l => `<div class="row"><div><b>${esc({ approve: "اعتماد", unapprove: "إلغاء اعتماد", recount: "إعادة عد", undoRecount: "إلغاء إعادة عد", export: "تصدير", import: "رفع بيانات", move: "تحويل" }[l.action] || l.action)}</b> <span class="sub">${esc(l.detail || "")}</span></div><span class="sub" dir="ltr">${fmtTs(l.at)}</span></div>`).join("");
   mgrShell(`
     <div class="card"><h2>رفع البيانات</h2>
       <p class="note">ارفع ملف app_data.json اللي يجهزه Claude من ملفات الإكسل. الرفع الثاني يحدّث الكميات والمواقع، وما يمسح العدّ ولا الاعتمادات.</p>
@@ -992,7 +1035,7 @@ function render() {
   return renderCount();
 }
 let lastRender = 0;
-const GUARDED = new Set(["approve", "bulkAsk", "bulkYes", "unapprove", "rc", "rcOpen", "confirm", "done", "xAsk", "xYes", "mvAsk", "mvYes"]);
+const GUARDED = new Set(["approve", "bulkAsk", "bulkYes", "unapprove", "rc", "rcOpen", "confirm", "done", "xAsk", "xYes", "mvAsk", "mvYes", "uxAsk", "uxYes"]);
 app.addEventListener("click", async ev => {
   const b = ev.target.closest("[data-act]"); if (!b) return;
   const a = b.dataset.act;
@@ -1013,13 +1056,13 @@ app.addEventListener("click", async ev => {
       case "done": if (!validateDraft()) { UI.noFocus = true; return render(); } UI.view = "summary"; scrollTo(0, 0); return render();
       case "edit": UI.view = "count"; UI.noFocus = true; return render();
       case "confirm": scrollTo(0, 0); return confirmEntry();
-      case "tab": UI.tab = b.dataset.tab; UI.page = 1; UI.rcOpen = null; UI.confirmBulk = false; UI.xc = null; UI.mv = null; return render();
+      case "tab": UI.tab = b.dataset.tab; UI.page = 1; UI.rcOpen = null; UI.confirmBulk = false; UI.xc = null; UI.mv = null; UI.ux = null; return render();
       case "more": UI.page++; return render();
       case "who": UI.who = b.dataset.r; UI.page = 1; UI.rcOpen = null; UI.xc = null; return render();
       case "flt": UI[b.dataset.k] = !UI[b.dataset.k]; UI.page = 1; UI.rcOpen = null; UI.xc = null; return render();
       case "qClear": UI.q = ""; UI.qDraft = ""; UI.page = 1; UI.rcOpen = null; UI.xc = null; return render();
-      case "dqClear": UI.dq = ""; UI.dqDraft = ""; UI.mv = null; return render();
-      case "mvAsk": { const [sh, wh] = b.dataset.to.split(":"); UI.mv = { id, to: { shop: sh === "1", wh } }; return render(); }
+      case "dqClear": UI.dq = ""; UI.dqDraft = ""; UI.mv = null; UI.ux = null; return render();
+      case "mvAsk": { const [sh, wh] = b.dataset.to.split(":"); UI.mv = { id, to: { shop: sh === "1", wh } }; UI.ux = null; return render(); }
       case "mvNo": UI.mv = null; return render();
       case "mvYes": { const m = UI.mv; UI.mv = null; if (!m) return render(); const p = S.parts.get(m.id);
         if (!p || p.approved || p.expS || p.expW) { toast("ما تتحول وهي معتمدة"); return render(); }
@@ -1029,6 +1072,12 @@ app.addEventListener("click", async ev => {
       case "bulkNo": UI.confirmBulk = false; return render();
       case "bulkYes": { const ids = activeParts().filter(p => partStatus(p) === "review" && partTotal(p) === p.q).map(p => p.id); UI.confirmBulk = false; await store.approve(ids); toast(`اعتُمدت ${ids.length} قطعة`); return render(); }
       case "unapprove": await store.unapprove(id); toast("رجعت للمراجعة"); return render();
+      case "rcList": UI.rcList = !UI.rcList; UI.ux = null; return render();
+      case "uxAsk": UI.ux = id; UI.mv = null; return render();
+      case "uxNo": UI.ux = null; return render();
+      case "uxYes": { UI.ux = null; const p = S.parts.get(id); const places = p && !p.approved ? undoPlaces(p) : [];
+        if (!places.length) { toast("الموظف عدّها خلاص، فما فيه شي ينلغى"); return render(); }
+        await store.undoRecount(id, places); toast("انلغت إعادة العد، وهي في المراجعة"); return render(); }
       case "rcOpen": UI.rcOpen = id; return render();
       case "rcClose": UI.rcOpen = null; return render();
       case "rc": { const p = S.parts.get(id); const places = b.dataset.p.split("").filter(pl => partKeys(p).includes(id + "_" + pl)); UI.rcOpen = null; await store.recount(id, places); toast("رجعت للموظف لإعادة العد"); return render(); }
@@ -1057,7 +1106,7 @@ app.addEventListener("input", ev => {
 app.addEventListener("submit", ev => {
   const k = { mqForm: "q", dqForm: "dq" }[ev.target.id]; if (!k) return;
   ev.preventDefault();
-  UI[k] = UI[k + "Draft"].trim(); UI.page = 1; UI.rcOpen = null; UI.xc = null; UI.mv = null;
+  UI[k] = UI[k + "Draft"].trim(); UI.page = 1; UI.rcOpen = null; UI.xc = null; UI.mv = null; UI.ux = null;
   if (document.activeElement) document.activeElement.blur();
   render();
 });
